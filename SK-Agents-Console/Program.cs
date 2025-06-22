@@ -11,8 +11,12 @@ using Microsoft.SemanticKernel.Agents.Orchestration.Sequential;
 using Microsoft.SemanticKernel.Agents.Runtime.InProcess;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.Ollama;
+using Microsoft.SemanticKernel.Connectors.OpenAI;
 using OpenAI.Assistants;
 using OpenAI.Chat;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Schema;
 using System.Text.Json.Serialization;
 using static BaseOrchestration;
 using ChatMessageContent = Microsoft.SemanticKernel.ChatMessageContent;
@@ -21,12 +25,12 @@ BaseOrchestration orchestrationConfig = new();
 using ILoggerFactory factory = LoggerFactory.Create(builder => builder.AddConsole());
 string ollamaModelName = "granite3.3";
 
-//await RunSequentialOrchestrationExample();
+await RunSequentialOrchestrationExample();
 //await RunConcurrentOrchestrationExample();
 //await RunGroupChatWithAIManagerOrchestrationExample(); // Issue with StructuredOutput in Ollama
 //await RunGroupChatWithHumanInTheLoopOrchestrationExample();
 //await RunHandoffOrchestrationExample();
-await RunHandoffWithStructuredInputOrchestrationExample(); // Issue
+//await RunHandoffWithStructuredInputOrchestrationExample(); // Issue
 
 async Task RunHandoffWithStructuredInputOrchestrationExample()
 {
@@ -694,6 +698,9 @@ sealed class AIGroupChatManager(string topic, IChatCompletionService chatComplet
                 You are mediator that guides a discussion on the topic of '{topic}'. 
                 You need to determine if the discussion has reached a conclusion. 
                 If you would like to end the discussion, please respond with True. Otherwise, respond with False.
+                Response should be in JSON object format with the value of "value" set to true or false, and the
+                value of "reason" set to any text output.
+                No other text or sentences must be output including the word "assistant". Only the JSON response.
                 """;
 
         public static string Selection(string topic, string participants) =>
@@ -703,6 +710,8 @@ sealed class AIGroupChatManager(string topic, IChatCompletionService chatComplet
                 Here are the names and descriptions of the participants: 
                 {participants}\n
                 Please respond with only the name of the participant you would like to select.
+                Response should be in JSON object format with the value of "value" set to the name of the participant.
+                No other text or sentences must be output including the word "assistant". Only the JSON response.
                 """;
 
         public static string Filter(string topic) =>
@@ -710,16 +719,20 @@ sealed class AIGroupChatManager(string topic, IChatCompletionService chatComplet
                 You are mediator that guides a discussion on the topic of '{topic}'. 
                 You have just concluded the discussion. 
                 Please summarize the discussion and provide a closing statement.
+                Response should be in JSON object format with the value of "value" set to the summary of the discussion.
+                No other text or sentences must be output including the word "assistant". Only the JSON response.
                 """;
     }
 
+    readonly JsonSerializerOptions options = JsonSerializerOptions.Default;
+
     /// <inheritdoc/>
     public override ValueTask<GroupChatManagerResult<string>> FilterResults(ChatHistory history, CancellationToken cancellationToken = default) =>
-        this.GetResponseAsync(history, Prompts.Filter(topic), cancellationToken);
+        this.GetResponseAsync<string>(history, Prompts.Filter(topic), cancellationToken);
 
     /// <inheritdoc/>
     public override ValueTask<GroupChatManagerResult<string>> SelectNextAgent(ChatHistory history, GroupChatTeam team, CancellationToken cancellationToken = default) =>
-        this.GetResponseAsync(history, Prompts.Selection(topic, team.FormatList()), cancellationToken);
+        this.GetResponseAsync<string>(history, Prompts.Selection(topic, team.FormatList()), cancellationToken);
 
     /// <inheritdoc/>
     public override ValueTask<GroupChatManagerResult<bool>> ShouldRequestUserInput(ChatHistory history, CancellationToken cancellationToken = default) =>
@@ -731,19 +744,26 @@ sealed class AIGroupChatManager(string topic, IChatCompletionService chatComplet
         GroupChatManagerResult<bool> result = await base.ShouldTerminate(history, cancellationToken);
         if (!result.Value)
         {
-            var x = await this.GetResponseAsync(history, Prompts.Termination(topic), cancellationToken);
-            result = new GroupChatManagerResult<bool>(bool.Parse(x.Value));
+            result = await this.GetResponseAsync<bool>(history, Prompts.Termination(topic), cancellationToken);
         }
         return result;
     }
 
-    private async ValueTask<GroupChatManagerResult<string>> GetResponseAsync(ChatHistory history, string prompt, CancellationToken cancellationToken = default)
+    private async ValueTask<GroupChatManagerResult<TValue>> GetResponseAsync<TValue>(ChatHistory history, string prompt, CancellationToken cancellationToken = default)
     {
-        OllamaPromptExecutionSettings executionSettings = new() { };
+        JsonNode schema = options.GetJsonSchemaAsNode(typeof(GroupChatManagerResult<TValue>));
+        var x = schema.ToString();
+
+        Dictionary<string, object> extensionData = new()
+        {
+            { "format", schema.ToString() },
+        };
+        OllamaPromptExecutionSettings executionSettings = new() { ExtensionData = extensionData };
         ChatHistory request = [.. history, new ChatMessageContent(AuthorRole.System, prompt)];
         ChatMessageContent response = await chatCompletion.GetChatMessageContentAsync(request, executionSettings, kernel: null, cancellationToken);
         string responseText = response.ToString();
-        return new GroupChatManagerResult<string>(responseText) ??
+        return
+            JsonSerializer.Deserialize<GroupChatManagerResult<TValue>>(responseText) ??
             throw new InvalidOperationException($"Failed to parse response: {responseText}");
     }
 }
